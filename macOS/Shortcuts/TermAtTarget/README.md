@@ -1,21 +1,46 @@
 # Term At Target
 
-AppleScript component for macOS Shortcuts that opens Terminal at user-selected Finder locations.
+Open Terminal at the selected Finder location using a macOS Shortcut + AppleScript.
 
-## What it does
+## Features
 
-- Opens Terminal in any folder selected in Finder
-- Handles files, folders, and Finder aliases
-- Provides options for folder navigation (inside vs parent level)
+- Opens Terminal for a selected Finder folder.
+- If a file is selected, opens Terminal in that file’s containing folder.
+- Supports Finder aliases (choose target location or alias location).
+- Supports folder open mode: inside folder or parent level.
+- Includes a run lock to avoid double-trigger launches.
 
-Perfect for users searching for "open terminal here", "terminal shortcut", "cd to folder", "open command line here", or "terminal at current location" solutions on macOS.
+## Requirements
+
+- macOS with Shortcuts and Terminal app available.
+- Finder selection passed into the Shortcut as input.
+- AppleScript action inside the Shortcut.
 
 ## Installation
 
-This AppleScript is designed to be used as part of a macOS Shortcut. For complete setup instructions, visit:
+Use the setup guide:
 
-**[https://resolve.resoltico.com/apps/term-at-target/](https://resolve.resoltico.com/apps/term-at-target/)**
+[https://resolve.resoltico.com/apps/term-at-target/](https://resolve.resoltico.com/apps/term-at-target/)
+
+## Configuration
+
+Set these AppleScript properties in the script:
+
+- `defaultFolderAction`: `ASK`, `INSIDE`, `LEVEL`
+- `defaultAliasAction`: `ASK`, `TARGET`, `ALIAS`
+
+## Usage
+
+1. Select a file, folder, or alias in Finder.
+2. Run the Shortcut.
+3. Terminal opens at the resolved location.
+
+## Troubleshooting
+
+- If files/folders are duplicated, check Finder shortcut conflicts.
+- Do not bind this Shortcut to `⌘D` (Finder Duplicate).
+- If Terminal opens twice, verify the Shortcut is not assigned in multiple places.
 
 ## License
 
-MIT License - see file for details.
+MIT License. See `LICENSE`.
