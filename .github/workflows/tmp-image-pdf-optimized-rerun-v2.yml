@@ -1,0 +1,185 @@
+name: Temporary optimized image-to-PDF rerun v2
+
+on:
+  push:
+    branches:
+      - tmp-image-pdf-benchmark-20260904
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tmp-image-pdf-optimized-rerun-v2-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    name: ${{ matrix.label }} optimized rerun v2
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            label: macos
+          - os: ubuntu-24.04
+            label: ubuntu
+    env:
+      MAGICK_THREAD_LIMIT: "4"
+      VIPS_CONCURRENCY: "4"
+      OMP_NUM_THREADS: "4"
+      GOMAXPROCS: "4"
+    steps:
+      - name: Check out benchmark branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Reconstruct and patch benchmark harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .benchmark/current-chunks/part-* > .benchmark/run_benchmark.py.gz
+          echo '6f17bf64066064856265acc8a34a356c478064e644859b29ac1ef68e832f823a  .benchmark/run_benchmark.py.gz' \
+            | shasum -a 256 --check
+          gzip --decompress --stdout .benchmark/run_benchmark.py.gz > .benchmark/run_benchmark.py
+          echo '95961a6af209d391e13e653cfefb5e0fa7450b26a52bde33d153e4cf7fdb9156  .benchmark/run_benchmark.py' \
+            | shasum -a 256 --check
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import textwrap
+
+          path = Path('.benchmark/run_benchmark.py')
+          source = path.read_text(encoding='utf-8')
+          optimized_cpdf = textwrap.dedent('''\
+          def pipeline_vips_cpdf(tools: Toolchain, inputs: Sequence[Path], output: Path, workspace: Path) -> None:
+              pages = prepare_vips_pages(tools, inputs, workspace)
+              one_page_dir = workspace / "cpdf-pages"
+              one_page_dir.mkdir()
+              raw_pages: list[Path] = []
+              merged_raw = one_page_dir / "merged-raw.pdf"
+              try:
+                  for index, page in enumerate(pages):
+                      raw_page = one_page_dir / f"{index:04d}-raw.pdf"
+                      run_checked([tools.cpdf, "-jpeg", str(page), "-o", str(raw_page)])
+                      raw_pages.append(raw_page)
+                  run_checked(
+                      [tools.cpdf, "-merge", *[str(item) for item in raw_pages], "-o", str(merged_raw)]
+                  )
+                  cleanup_paths(raw_pages)
+                  raw_pages.clear()
+                  run_checked(
+                      [
+                          tools.cpdf,
+                          "-scale-page",
+                          "0.24 0.24",
+                          str(merged_raw),
+                          "-o",
+                          str(output),
+                      ]
+                  )
+              finally:
+                  cleanup_paths(raw_pages)
+                  merged_raw.unlink(missing_ok=True)
+                  cleanup_paths(pages)
+                  one_page_dir.rmdir()
+                  (workspace / "page-jpegs").rmdir()
+          ''').rstrip()
+          pattern = r'def pipeline_vips_cpdf\(.*?(?=\n\ndef write_single_page_pdf)'
+          source, count = re.subn(pattern, optimized_cpdf, source, count=1, flags=re.DOTALL)
+          if count != 1:
+              raise SystemExit(f'expected one cpdf function, replaced {count}')
+
+          old_pdfcpu = 'f"dim:{PAGE_WIDTH_PT:.2f} {PAGE_HEIGHT_PT:.2f}, pos:c, dpi:300"'
+          new_pdfcpu = 'f"dim:{PAGE_WIDTH_PT:.2f} {PAGE_HEIGHT_PT:.2f}, pos:c, sc:1 rel"'
+          if source.count(old_pdfcpu) != 1:
+              raise SystemExit(
+                  f'expected one pdfcpu expression, found {source.count(old_pdfcpu)}'
+              )
+          source = source.replace(old_pdfcpu, new_pdfcpu)
+          path.write_text(source, encoding='utf-8')
+          PY
+          python3 -m py_compile .benchmark/run_benchmark.py
+          shasum -a 256 .benchmark/run_benchmark.py > .benchmark/patched-harness-SHA256SUMS
+
+      - name: Install macOS toolchain
+        if: matrix.label == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew update
+          brew install imagemagick vips qpdf pdfcpu poppler
+
+      - name: Install Ubuntu toolchain
+        if: matrix.label == 'ubuntu'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            ca-certificates curl ghostscript imagemagick libvips-tools \
+            poppler-utils qpdf xz-utils
+          for policy in /etc/ImageMagick-*/policy.xml; do
+            if [[ -f "$policy" ]]; then
+              sudo sed -i \
+                -e 's#<policy domain="coder" rights="none" pattern="PDF" */>#<policy domain="coder" rights="read|write" pattern="PDF"/>#g' \
+                -e 's#<policy domain="module" rights="none" pattern="{PS,PDF,XPS}" */>#<policy domain="module" rights="read|write" pattern="{PS,PDF,XPS}"/>#g' \
+                "$policy"
+            fi
+          done
+          mkdir -p .benchmark/bin/pdfcpu-unpack
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://github.com/pdfcpu/pdfcpu/releases/download/v0.15.0/pdfcpu_0.15.0_Linux_x86_64.tar.xz \
+            --output .benchmark/bin/pdfcpu.tar.xz
+          echo '652830db95e81868dbe38fbb3f506365511c99a1831b5e8955deac38f3f645f8  .benchmark/bin/pdfcpu.tar.xz' \
+            | sha256sum --check --strict
+          tar -xJf .benchmark/bin/pdfcpu.tar.xz -C .benchmark/bin/pdfcpu-unpack
+          pdfcpu_source=$(find .benchmark/bin/pdfcpu-unpack -type f -name pdfcpu -perm -u+x -print -quit)
+          test -n "$pdfcpu_source"
+          cp "$pdfcpu_source" .benchmark/bin/pdfcpu
+          chmod 0755 .benchmark/bin/pdfcpu
+          printf '%s\n' "$GITHUB_WORKSPACE/.benchmark/bin" >> "$GITHUB_PATH"
+
+      - name: Install pinned cpdf binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .benchmark/bin
+          if [[ "${{ matrix.label }}" == "macos" ]]; then
+            cpdf_platform=MacOS-ARM
+          else
+            cpdf_platform=Linux-Intel-64bit
+          fi
+          curl --fail --location --retry 5 --retry-all-errors \
+            "https://raw.githubusercontent.com/coherentgraphics/cpdf-binaries/6341ce3699e46659bb2b59c216f37d2829ea97f8/$cpdf_platform/cpdf" \
+            --output .benchmark/bin/cpdf
+          chmod 0755 .benchmark/bin/cpdf
+          printf '%s\n' "$GITHUB_WORKSPACE/.benchmark/bin" >> "$GITHUB_PATH"
+
+      - name: Create isolated Python environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv .benchmark/optimized-venv
+          .benchmark/optimized-venv/bin/python -m pip install \
+            --disable-pip-version-check --no-cache-dir numpy pillow psutil
+
+      - name: Run optimized timing and parity matrix
+        shell: bash
+        env:
+          BENCHMARK_LABEL: ${{ matrix.label }}
+        run: |
+          set -euo pipefail
+          .benchmark/optimized-venv/bin/python .benchmark/optimized_rerun.py
+
+      - name: Upload optimized evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: optimized-image-pdf-${{ matrix.label }}-${{ github.run_id }}
+          path: optimized-rerun-${{ matrix.label }}/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30
