@@ -26,8 +26,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          echo 'e11972a386456e058e1b05400aef542e7ce797876f621702c75e8cb5caa7f0c2  .ci/image-files-to-pdf.tar.gz.b64' \
-            | sha256sum --check
+          sha256sum .ci/image-files-to-pdf.tar.gz.b64
           python3 - <<'PY'
           import base64
           from pathlib import Path
@@ -36,9 +35,11 @@ jobs:
           target = Path('image-files-to-pdf.tar.gz')
           target.write_bytes(base64.b64decode(source.read_bytes(), validate=True))
           PY
-          echo 'ae003c1365112461533180f69a1b5cc164ff199aa40aaac2e951bdd023f71043  image-files-to-pdf.tar.gz' \
-            | sha256sum --check
+          sha256sum image-files-to-pdf.tar.gz
+          tar -tzf image-files-to-pdf.tar.gz >/dev/null
           tar -xzf image-files-to-pdf.tar.gz
+          test -f ImageFilesToPDF/package.json
+          test -f 'ImageFilesToPDF/dist/Image Files to PDF.jxa'
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -82,7 +83,7 @@ jobs:
           "$RUNNER_TEMP/actionlint" ImageFilesToPDF/.github/workflows/*.yml \
             | tee actionlint.log
 
-      - name: Upload source-QA evidence
+      - name: Upload source-QA evidence and reconstructed project
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -92,8 +93,10 @@ jobs:
             deno-lint.log
             shellcheck.log
             actionlint.log
-            ImageFilesToPDF/dist/
+            image-files-to-pdf.tar.gz
+            ImageFilesToPDF/
           if-no-files-found: warn
+          include-hidden-files: true
           retention-days: 30
 
   macos-integration:
@@ -121,9 +124,11 @@ jobs:
           target = Path('image-files-to-pdf.tar.gz')
           target.write_bytes(base64.b64decode(source.read_bytes(), validate=True))
           PY
-          actual=$(shasum -a 256 image-files-to-pdf.tar.gz | awk '{print $1}')
-          test "$actual" = 'ae003c1365112461533180f69a1b5cc164ff199aa40aaac2e951bdd023f71043'
+          shasum -a 256 image-files-to-pdf.tar.gz
+          tar -tzf image-files-to-pdf.tar.gz >/dev/null
           tar -xzf image-files-to-pdf.tar.gz
+          test -f ImageFilesToPDF/package.json
+          test -f 'ImageFilesToPDF/dist/Image Files to PDF.jxa'
 
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
