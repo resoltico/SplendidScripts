@@ -30,28 +30,20 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Expand and patch benchmark harness
+      - name: Reconstruct and verify benchmark harness
         shell: bash
         run: |
           set -euo pipefail
-          cat .benchmark/chunks-v2/part-* > .benchmark/run_benchmark.py.gz
-          echo '966f26d11076d955ff1a343e59a2f37927bc34694e8403698a251060d2204987  .benchmark/run_benchmark.py.gz' | sha256sum --check --strict
+          cat .benchmark/current-chunks/part-* > .benchmark/run_benchmark.py.gz
+          echo '8c3de21d57df592dd7282dc8dc54c35d70c06422fc957203ea4966159ccc2d2c  .benchmark/run_benchmark.py.gz' \
+            | sha256sum --check --strict
           gzip --decompress --stdout .benchmark/run_benchmark.py.gz > .benchmark/run_benchmark.py
-          echo '5678b9fe87f9f08d9eef9b5f9085a71bcd29b06d35a16eb378bb235cd545b94d  .benchmark/run_benchmark.py' | sha256sum --check --strict
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('.benchmark/run_benchmark.py')
-          source = path.read_text(encoding='utf-8')
-          old = 'run_checked([tools.cpdf, "-jpeg", str(page), "-o", str(one_page)])'
-          new = 'run_checked([tools.cpdf, "-jpeg", str(page), "AND", "-scale-to-fit", "a4portrait", "-o", str(one_page)])'
-          if source.count(old) != 1:
-              raise SystemExit('the exact cpdf pipeline patch target was not found once')
-          path.write_text(source.replace(old, new), encoding='utf-8')
-          PY
+          echo '9591fdba7c788288f1784c34068815934192da2a2a078aeb1a96852ae838544  .benchmark/run_benchmark.py' \
+            | sha256sum --check --strict
           python3 -m py_compile .benchmark/run_benchmark.py
           mkdir -p benchmark-artifacts/harness
           cp .benchmark/run_benchmark.py benchmark-artifacts/harness/run_benchmark.py
-          sha256sum .benchmark/run_benchmark.py | tee benchmark-artifacts/harness/SHA256SUMS
+          sha256sum .benchmark/run_benchmark.py > benchmark-artifacts/harness/SHA256SUMS
 
       - name: Install distribution toolchain
         shell: bash
@@ -63,7 +55,6 @@ jobs:
             curl \
             file \
             ghostscript \
-            imagemagick \
             libvips-tools \
             poppler-utils \
             python3-numpy \
@@ -72,25 +63,31 @@ jobs:
             qpdf \
             xz-utils
 
-          # Ubuntu's ImageMagick policy commonly disables PDF writing. The benchmark
-          # needs the exact image-to-PDF operation under test, inside an ephemeral VM.
-          for policy in /etc/ImageMagick-*/policy.xml; do
-            if [[ -f "$policy" ]]; then
-              sudo sed -i \
-                -e 's#<policy domain="coder" rights="none" pattern="PDF" */>#<policy domain="coder" rights="read|write" pattern="PDF"/>#g' \
-                -e 's#<policy domain="module" rights="none" pattern="{PS,PDF,XPS}" */>#<policy domain="module" rights="read|write" pattern="{PS,PDF,XPS}"/>#g' \
-                "$policy"
-            fi
-          done
-
-      - name: Install current cpdf and pdfcpu binaries
+      - name: Install pinned ImageMagick 7, cpdf, and pdfcpu binaries
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p .benchmark/bin/pdfcpu-unpack
+          mkdir -p .benchmark/bin .benchmark/imagemagick .benchmark/bin/pdfcpu-unpack
 
           curl --fail --location --retry 5 --retry-all-errors \
-            https://raw.githubusercontent.com/coherentgraphics/cpdf-binaries/master/Linux-Intel-64bit/cpdf \
+            https://github.com/ImageMagick/ImageMagick/releases/download/7.1.2-29/ImageMagick-7.1.2-29-gcc-x86_64.AppImage \
+            --output .benchmark/imagemagick/ImageMagick.AppImage
+          echo 'd43978debd8c25b12c26e368f93de827a8dc45fd13396126ae9b758cd3570485  .benchmark/imagemagick/ImageMagick.AppImage' \
+            | sha256sum --check --strict
+          chmod 0755 .benchmark/imagemagick/ImageMagick.AppImage
+          (
+            cd .benchmark/imagemagick
+            ./ImageMagick.AppImage --appimage-extract >/dev/null
+          )
+          cat > .benchmark/bin/magick <<'SH'
+          #!/bin/sh
+          set -eu
+          exec "$GITHUB_WORKSPACE/.benchmark/imagemagick/squashfs-root/AppRun" "$@"
+          SH
+          chmod 0755 .benchmark/bin/magick
+
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://raw.githubusercontent.com/coherentgraphics/cpdf-binaries/6341ce3699e46659bb2b59c216f37d2829ea97f8/Linux-Intel-64bit/cpdf \
             --output .benchmark/bin/cpdf
           chmod 0755 .benchmark/bin/cpdf
 
@@ -105,7 +102,28 @@ jobs:
           cp "$pdfcpu_source" .benchmark/bin/pdfcpu
           chmod 0755 .benchmark/bin/pdfcpu
           rm -rf .benchmark/bin/pdfcpu-unpack .benchmark/bin/pdfcpu.tar.xz
+          sha256sum .benchmark/bin/cpdf .benchmark/bin/pdfcpu > benchmark-artifacts/harness/tool-binary-SHA256SUMS
           printf '%s\n' "$GITHUB_WORKSPACE/.benchmark/bin" >> "$GITHUB_PATH"
+
+      - name: Smoke-test complete tool capabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .benchmark/smoke
+          python3 - <<'PY'
+          from PIL import Image
+          Image.new('RGB', (400, 600), (120, 180, 220)).save('.benchmark/smoke/input.jpg', quality=92)
+          PY
+          magick -version
+          magick .benchmark/smoke/input.jpg -format '%w %h\n' info:
+          vips --version
+          cpdf -jpeg .benchmark/smoke/input.jpg -o .benchmark/smoke/cpdf.pdf
+          cpdf -scale-page '1.4886 1.4030' .benchmark/smoke/cpdf.pdf -o .benchmark/smoke/cpdf-a4.pdf
+          pdfcpu import -- 'dim:595.44 841.68, pos:c, dpi:300' \
+            .benchmark/smoke/pdfcpu.pdf .benchmark/smoke/input.jpg
+          qpdf --check .benchmark/smoke/cpdf-a4.pdf
+          qpdf --check .benchmark/smoke/pdfcpu.pdf
+          rm -rf .benchmark/smoke
 
       - name: Record tool probes
         shell: bash
@@ -114,17 +132,13 @@ jobs:
           mkdir -p benchmark-artifacts/probes
           {
             echo '## ImageMagick'
-            (magick -version || convert -version) 2>&1
+            magick -version 2>&1
             echo '## vips'
             vips --version 2>&1
             echo '## vips thumbnail help'
             vips thumbnail --help-operation 2>&1
-            echo '## vips flatten help'
-            vips flatten --help-operation 2>&1
             echo '## vips gravity help'
             vips gravity --help-operation 2>&1
-            echo '## vips copy help'
-            vips copy --help-operation 2>&1
             echo '## cpdf'
             cpdf -version 2>&1
             echo '## qpdf'
@@ -147,7 +161,17 @@ jobs:
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: image-pdf-benchmark-${{ github.run_id }}
-          path: benchmark-artifacts/
-          if-no-files-found: error
+          path: |
+            benchmark-artifacts/REPORT.md
+            benchmark-artifacts/SHA256SUMS
+            benchmark-artifacts/*.csv
+            benchmark-artifacts/*.json
+            benchmark-artifacts/*.log
+            benchmark-artifacts/harness/
+            benchmark-artifacts/logs/
+            benchmark-artifacts/probes/
+            benchmark-artifacts/representative-outputs/
+            benchmark-artifacts/visual-qa/
+          if-no-files-found: warn
           include-hidden-files: true
           retention-days: 30
