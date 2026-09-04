@@ -1,140 +1,14 @@
-name: Temporary corrected pdfcpu benchmark
+name: Temporary corrected pdfcpu benchmark (superseded)
 
 on:
-  push:
-    branches:
-      - tmp-image-pdf-benchmark-20260904
+  workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: tmp-corrected-pdfcpu-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  benchmark:
-    name: ${{ matrix.label }} corrected pdfcpu
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-15
-            label: macos
-          - os: ubuntu-24.04
-            label: ubuntu
-    env:
-      MAGICK_THREAD_LIMIT: "4"
-      VIPS_CONCURRENCY: "4"
-      OMP_NUM_THREADS: "4"
-      GOMAXPROCS: "4"
+  archived:
+    if: ${{ false }}
+    runs-on: ubuntu-24.04
     steps:
-      - name: Check out benchmark branch
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Reconstruct and patch benchmark harness
-        shell: bash
-        run: |
-          set -euo pipefail
-          cat .benchmark/current-chunks/part-* > .benchmark/run_benchmark.py.gz
-          echo '6f17bf64066064856265acc8a34a356c478064e644859b29ac1ef68e832f823a  .benchmark/run_benchmark.py.gz' \
-            | shasum -a 256 --check
-          gzip --decompress --stdout .benchmark/run_benchmark.py.gz > .benchmark/run_benchmark.py
-          echo '95961a6af209d391e13e653cfefb5e0fa7450b26a52bde33d153e4cf7fdb9156  .benchmark/run_benchmark.py' \
-            | shasum -a 256 --check
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('.benchmark/run_benchmark.py')
-          source = path.read_text(encoding='utf-8')
-          old = 'f"dim:{PAGE_WIDTH_PT:.2f} {PAGE_HEIGHT_PT:.2f}, pos:c, dpi:300"'
-          new = 'f"dim:{PAGE_WIDTH_PT:.2f} {PAGE_HEIGHT_PT:.2f}, pos:full"'
-          if source.count(old) != 1:
-              raise SystemExit(f'expected one pdfcpu expression, found {source.count(old)}')
-          path.write_text(source.replace(old, new), encoding='utf-8')
-          PY
-          python3 -m py_compile .benchmark/run_benchmark.py
-          shasum -a 256 .benchmark/run_benchmark.py > .benchmark/patched-harness-SHA256SUMS
-
-      - name: Install macOS toolchain
-        if: matrix.label == 'macos'
-        shell: bash
-        run: |
-          set -euo pipefail
-          brew update
-          brew install imagemagick vips qpdf pdfcpu poppler
-
-      - name: Install Ubuntu toolchain
-        if: matrix.label == 'ubuntu'
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            ca-certificates curl ghostscript imagemagick libvips-tools \
-            poppler-utils qpdf xz-utils
-          for policy in /etc/ImageMagick-*/policy.xml; do
-            if [[ -f "$policy" ]]; then
-              sudo sed -i \
-                -e 's#<policy domain="coder" rights="none" pattern="PDF" */>#<policy domain="coder" rights="read|write" pattern="PDF"/>#g' \
-                -e 's#<policy domain="module" rights="none" pattern="{PS,PDF,XPS}" */>#<policy domain="module" rights="read|write" pattern="{PS,PDF,XPS}"/>#g' \
-                "$policy"
-            fi
-          done
-          mkdir -p .benchmark/bin/pdfcpu-unpack
-          curl --fail --location --retry 5 --retry-all-errors \
-            https://github.com/pdfcpu/pdfcpu/releases/download/v0.15.0/pdfcpu_0.15.0_Linux_x86_64.tar.xz \
-            --output .benchmark/bin/pdfcpu.tar.xz
-          echo '652830db95e81868dbe38fbb3f506365511c99a1831b5e8955deac38f3f645f8  .benchmark/bin/pdfcpu.tar.xz' \
-            | sha256sum --check --strict
-          tar -xJf .benchmark/bin/pdfcpu.tar.xz -C .benchmark/bin/pdfcpu-unpack
-          pdfcpu_source=$(find .benchmark/bin/pdfcpu-unpack -type f -name pdfcpu -perm -u+x -print -quit)
-          test -n "$pdfcpu_source"
-          cp "$pdfcpu_source" .benchmark/bin/pdfcpu
-          chmod 0755 .benchmark/bin/pdfcpu
-          printf '%s\n' "$GITHUB_WORKSPACE/.benchmark/bin" >> "$GITHUB_PATH"
-
-      - name: Install pinned cpdf probe dependency
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p .benchmark/bin
-          if [[ "${{ matrix.label }}" == "macos" ]]; then
-            cpdf_platform=MacOS-ARM
-          else
-            cpdf_platform=Linux-Intel-64bit
-          fi
-          curl --fail --location --retry 5 --retry-all-errors \
-            "https://raw.githubusercontent.com/coherentgraphics/cpdf-binaries/6341ce3699e46659bb2b59c216f37d2829ea97f8/$cpdf_platform/cpdf" \
-            --output .benchmark/bin/cpdf
-          chmod 0755 .benchmark/bin/cpdf
-          printf '%s\n' "$GITHUB_WORKSPACE/.benchmark/bin" >> "$GITHUB_PATH"
-
-      - name: Create isolated Python environment
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -m venv .benchmark/correction-venv
-          .benchmark/correction-venv/bin/python -m pip install \
-            --disable-pip-version-check --no-cache-dir numpy pillow psutil
-
-      - name: Run corrected timing and parity matrix
-        shell: bash
-        env:
-          BENCHMARK_LABEL: ${{ matrix.label }}
-        run: |
-          set -euo pipefail
-          .benchmark/correction-venv/bin/python .benchmark/pdfcpu_correction.py
-
-      - name: Upload corrected evidence
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: corrected-pdfcpu-${{ matrix.label }}-${{ github.run_id }}
-          path: pdfcpu-correction-${{ matrix.label }}/
-          if-no-files-found: error
-          include-hidden-files: true
-          retention-days: 30
+      - run: echo superseded
