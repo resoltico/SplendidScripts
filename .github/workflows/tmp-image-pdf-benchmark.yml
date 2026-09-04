@@ -34,7 +34,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cat .benchmark/chunks/part-* > .benchmark/run_benchmark.py.gz
+          cat .benchmark/chunks-v2/part-* > .benchmark/run_benchmark.py.gz
           echo '966f26d11076d955ff1a343e59a2f37927bc34694e8403698a251060d2204987  .benchmark/run_benchmark.py.gz' | sha256sum --check --strict
           gzip --decompress --stdout .benchmark/run_benchmark.py.gz > .benchmark/run_benchmark.py
           echo '5678b9fe87f9f08d9eef9b5f9085a71bcd29b06d35a16eb378bb235cd545b94d  .benchmark/run_benchmark.py' | sha256sum --check --strict
