@@ -30,7 +30,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Expand benchmark harness
+      - name: Expand and patch benchmark harness
         shell: bash
         run: |
           set -euo pipefail
@@ -38,7 +38,20 @@ jobs:
           echo '966f26d11076d955ff1a343e59a2f37927bc34694e8403698a251060d2204987  .benchmark/run_benchmark.py.gz' | sha256sum --check --strict
           gzip --decompress --stdout .benchmark/run_benchmark.py.gz > .benchmark/run_benchmark.py
           echo '5678b9fe87f9f08d9eef9b5f9085a71bcd29b06d35a16eb378bb235cd545b94d  .benchmark/run_benchmark.py' | sha256sum --check --strict
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('.benchmark/run_benchmark.py')
+          source = path.read_text(encoding='utf-8')
+          old = 'run_checked([tools.cpdf, "-jpeg", str(page), "-o", str(one_page)])'
+          new = 'run_checked([tools.cpdf, "-jpeg", str(page), "AND", "-scale-to-fit", "a4portrait", "-o", str(one_page)])'
+          if source.count(old) != 1:
+              raise SystemExit('the exact cpdf pipeline patch target was not found once')
+          path.write_text(source.replace(old, new), encoding='utf-8')
+          PY
           python3 -m py_compile .benchmark/run_benchmark.py
+          mkdir -p benchmark-artifacts/harness
+          cp .benchmark/run_benchmark.py benchmark-artifacts/harness/run_benchmark.py
+          sha256sum .benchmark/run_benchmark.py | tee benchmark-artifacts/harness/SHA256SUMS
 
       - name: Install distribution toolchain
         shell: bash
