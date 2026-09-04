@@ -1,0 +1,135 @@
+name: Final corrected image-to-PDF benchmark v2 — macOS
+
+on:
+  push:
+    branches:
+      - tmp-image-pdf-final-v2-20260904
+
+permissions:
+  contents: read
+
+concurrency:
+  group: final-corrected-image-pdf-benchmark-v2-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: macos-15
+    timeout-minutes: 210
+    env:
+      LC_ALL: en_US.UTF-8
+      LANG: en_US.UTF-8
+      MAGICK_THREAD_LIMIT: "4"
+      VIPS_CONCURRENCY: "4"
+      OMP_NUM_THREADS: "4"
+      GOMAXPROCS: "4"
+      BENCHMARK_REPEATS: "4"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - name: Check out isolated benchmark branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Reconstruct and patch benchmark harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p final-v2-benchmark-artifacts/harness
+          cat .benchmark/current-chunks/part-* > .benchmark/run_benchmark.py.gz
+          echo '6f17bf64066064856265acc8a34a356c478064e644859b29ac1ef68e832f823a  .benchmark/run_benchmark.py.gz' \
+            | shasum -a 256 --check
+          gzip --decompress --stdout .benchmark/run_benchmark.py.gz > .benchmark/run_benchmark.py
+          echo '95961a6af209d391e13e653cfefb5e0fa7450b26a52bde33d153e4cf7fdb9156  .benchmark/run_benchmark.py' \
+            | shasum -a 256 --check
+          echo '0e0875f065493e77cda90ee4e537610484a9398bce6d973711c16823ff8e9d36  .benchmark/final_v2_tools.tar.gz.b64' \
+            | shasum -a 256 --check
+          python3 - <<'PY'
+          import base64
+          import tarfile
+          from pathlib import Path
+
+          encoded = Path('.benchmark/final_v2_tools.tar.gz.b64')
+          archive = Path('.benchmark/final_v2_tools.tar.gz')
+          archive.write_bytes(base64.b64decode(encoded.read_bytes()))
+          PY
+          echo '959f5c095d7b8b2ecb1d46a230dbc2942cea1e9e5f4e3b077f04b6aac53c8e26  .benchmark/final_v2_tools.tar.gz' \
+            | shasum -a 256 --check
+          tar -xzf .benchmark/final_v2_tools.tar.gz -C .benchmark
+          python3 .benchmark/final_v2_patch.py .benchmark/run_benchmark.py
+          python3 -m py_compile \
+            .benchmark/run_benchmark.py \
+            .benchmark/final_v2_patch.py \
+            .benchmark/final_v2_qa.py
+          cp .benchmark/run_benchmark.py final-v2-benchmark-artifacts/harness/run_benchmark.py
+          cp .benchmark/final_v2_patch.py final-v2-benchmark-artifacts/harness/final_v2_patch.py
+          cp .benchmark/final_v2_qa.py final-v2-benchmark-artifacts/harness/final_v2_qa.py
+          shasum -a 256 \
+            .benchmark/run_benchmark.py \
+            .benchmark/final_v2_patch.py \
+            .benchmark/final_v2_qa.py \
+            > final-v2-benchmark-artifacts/harness/source-SHA256SUMS
+
+      - name: Install benchmark toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install imagemagick vips qpdf pdfcpu poppler
+          python3 -m venv .benchmark/final-v2-venv
+          .benchmark/final-v2-venv/bin/python -m pip install \
+            --disable-pip-version-check --no-cache-dir numpy pillow psutil
+
+      - name: Install pinned cpdf binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .benchmark/bin
+          case "$(uname -m)" in
+            arm64) cpdf_dir=MacOS-ARM ;;
+            x86_64) cpdf_dir=MacOS-Intel ;;
+            *) echo "unsupported macOS architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          curl --fail --location --retry 5 --retry-all-errors \
+            "https://raw.githubusercontent.com/coherentgraphics/cpdf-binaries/6341ce3699e46659bb2b59c216f37d2829ea97f8/${cpdf_dir}/cpdf" \
+            --output .benchmark/bin/cpdf
+          chmod 0755 .benchmark/bin/cpdf
+          shasum -a 256 .benchmark/bin/cpdf \
+            > final-v2-benchmark-artifacts/harness/cpdf-binary-SHA256SUMS
+          printf '%s\n' "$GITHUB_WORKSPACE/.benchmark/bin" >> "$GITHUB_PATH"
+
+      - name: Run corrected randomized benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          .benchmark/final-v2-venv/bin/python .benchmark/run_benchmark.py \
+            --output final-v2-benchmark-artifacts \
+            2>&1 | tee final-v2-benchmark-artifacts/benchmark-console.log
+
+      - name: Independently QA and seal result set
+        shell: bash
+        run: |
+          set -euo pipefail
+          .benchmark/final-v2-venv/bin/python .benchmark/final_v2_qa.py \
+            final-v2-benchmark-artifacts
+          test -s final-v2-benchmark-artifacts/REPORT.md
+          test -s final-v2-benchmark-artifacts/KEY-FINDINGS.md
+          test -s final-v2-benchmark-artifacts/QA.json
+          test -s final-v2-benchmark-artifacts/COMPLETED.json
+          grep -q '"complete": true' final-v2-benchmark-artifacts/QA.json
+          grep -q '"status": "complete"' final-v2-benchmark-artifacts/COMPLETED.json
+          ! grep -R -E \
+            'Benchmark not QA-qualified|completion marker is absent|required executable not found: vips|controlled Linux comparison' \
+            final-v2-benchmark-artifacts/REPORT.md \
+            final-v2-benchmark-artifacts/KEY-FINDINGS.md
+          shasum -a 256 --check final-v2-benchmark-artifacts/SHA256SUMS
+
+      - name: Upload corrected benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-pdf-benchmark-final-v2-macos-${{ github.run_id }}
+          path: final-v2-benchmark-artifacts/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30
