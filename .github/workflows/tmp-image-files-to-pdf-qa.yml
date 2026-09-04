@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: temporary-image-files-to-pdf-qa-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   source-quality:
@@ -33,7 +33,7 @@ jobs:
 
           source = Path('.ci/image-files-to-pdf.tar.gz.b64')
           target = Path('image-files-to-pdf.tar.gz')
-          target.write_bytes(base64.b64decode(source.read_bytes(), validate=True))
+          target.write_bytes(base64.b64decode(source.read_bytes()))
           PY
           sha256sum image-files-to-pdf.tar.gz
           tar -tzf image-files-to-pdf.tar.gz >/dev/null
@@ -122,7 +122,7 @@ jobs:
 
           source = Path('.ci/image-files-to-pdf.tar.gz.b64')
           target = Path('image-files-to-pdf.tar.gz')
-          target.write_bytes(base64.b64decode(source.read_bytes(), validate=True))
+          target.write_bytes(base64.b64decode(source.read_bytes()))
           PY
           shasum -a 256 image-files-to-pdf.tar.gz
           tar -tzf image-files-to-pdf.tar.gz >/dev/null
