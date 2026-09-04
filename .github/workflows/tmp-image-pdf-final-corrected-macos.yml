@@ -1,0 +1,405 @@
+name: Final corrected image-to-PDF benchmark — macOS
+
+on:
+  push:
+    branches:
+      - tmp-image-pdf-final-20260904
+
+permissions:
+  contents: read
+
+concurrency:
+  group: final-corrected-image-pdf-benchmark-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: macos-15
+    timeout-minutes: 210
+    env:
+      LC_ALL: en_US.UTF-8
+      LANG: en_US.UTF-8
+      MAGICK_THREAD_LIMIT: "4"
+      VIPS_CONCURRENCY: "4"
+      OMP_NUM_THREADS: "4"
+      GOMAXPROCS: "4"
+      BENCHMARK_REPEATS: "4"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - name: Check out isolated benchmark branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Reconstruct and correct benchmark harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p final-benchmark-artifacts/harness
+          cat .benchmark/current-chunks/part-* > .benchmark/run_benchmark.py.gz
+          echo '6f17bf64066064856265acc8a34a356c478064e644859b29ac1ef68e832f823a  .benchmark/run_benchmark.py.gz' \
+            | shasum -a 256 --check
+          gzip --decompress --stdout .benchmark/run_benchmark.py.gz > .benchmark/run_benchmark.py
+          echo '95961a6af209d391e13e653cfefb5e0fa7450b26a52bde33d153e4cf7fdb9156  .benchmark/run_benchmark.py' \
+            | shasum -a 256 --check
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import textwrap
+
+          path = Path('.benchmark/run_benchmark.py')
+          source = path.read_text(encoding='utf-8')
+
+          old_pdfcpu = 'f"dim:{PAGE_WIDTH_PT:.2f} {PAGE_HEIGHT_PT:.2f}, pos:c, dpi:300"'
+          new_pdfcpu = 'f"dim:{PAGE_WIDTH_PT:.2f} {PAGE_HEIGHT_PT:.2f}, pos:c, sc:1 rel"'
+          if source.count(old_pdfcpu) != 1:
+              raise SystemExit(f'expected one old pdfcpu expression, found {source.count(old_pdfcpu)}')
+          source = source.replace(old_pdfcpu, new_pdfcpu)
+
+          replacement = textwrap.dedent(r'''
+          def visual_qa(tools: Toolchain, artifact_root: Path) -> dict[str, Any]:
+              outputs = artifact_root / "working" / "representative-outputs"
+              renders = artifact_root / "visual-qa"
+              renders.mkdir(parents=True, exist_ok=True)
+              pages_per_profile = 8
+              per_page: dict[str, list[dict[str, Any]]] = {}
+              aggregate_errors: dict[str, list[np.ndarray]] = {
+                  pipeline: [] for pipeline in PIPELINES[1:]
+              }
+              for profile in PROFILES:
+                  scenario = f"{profile}-{max(SCENARIO_SIZES)}"
+                  baseline_pdf = outputs / f"{scenario}-imagemagick.pdf"
+                  if not baseline_pdf.is_file():
+                      raise CommandFailure(f"missing visual-QA baseline: {baseline_pdf}")
+                  baseline_pages: dict[int, np.ndarray] = {}
+                  for page_number in range(1, pages_per_profile + 1):
+                      rendered = render_sample(
+                          tools,
+                          baseline_pdf,
+                          renders / f"{scenario}-imagemagick-p{page_number:02d}.png",
+                          page_number,
+                      )
+                      with Image.open(rendered) as image:
+                          baseline_pages[page_number] = np.asarray(
+                              image.convert("RGB"), dtype=np.int16
+                          )
+
+                  for pipeline in PIPELINES[1:]:
+                      candidate_pdf = outputs / f"{scenario}-{pipeline}.pdf"
+                      if not candidate_pdf.is_file():
+                          raise CommandFailure(f"missing visual-QA candidate: {candidate_pdf}")
+                      rows: list[dict[str, Any]] = []
+                      for page_number in range(1, pages_per_profile + 1):
+                          rendered = render_sample(
+                              tools,
+                              candidate_pdf,
+                              renders / f"{scenario}-{pipeline}-p{page_number:02d}.png",
+                              page_number,
+                          )
+                          with Image.open(rendered) as image:
+                              candidate = np.asarray(image.convert("RGB"), dtype=np.int16)
+                          baseline = baseline_pages[page_number]
+                          if candidate.shape != baseline.shape:
+                              raise CommandFailure(
+                                  f"visual QA render dimensions differ: {candidate.shape} vs {baseline.shape}"
+                              )
+                          difference = np.abs(candidate - baseline)
+                          aggregate_errors[pipeline].append(difference.reshape(-1))
+                          nearest_page = min(
+                              baseline_pages,
+                              key=lambda other: float(
+                                  np.abs(candidate - baseline_pages[other]).mean()
+                              ),
+                          )
+                          rows.append(
+                              {
+                                  "page": page_number,
+                                  "nearest_imagemagick_page": nearest_page,
+                                  "order_match": nearest_page == page_number,
+                                  "mean_absolute_channel_error_0_255": float(difference.mean()),
+                                  "p99_absolute_channel_error_0_255": float(
+                                      np.percentile(difference, 99)
+                                  ),
+                                  "max_absolute_channel_error_0_255": int(difference.max()),
+                                  "render_width": int(candidate.shape[1]),
+                                  "render_height": int(candidate.shape[0]),
+                              }
+                          )
+                      per_page[f"{profile}/{pipeline}"] = rows
+
+              aggregate: dict[str, dict[str, Any]] = {}
+              for pipeline, arrays in aggregate_errors.items():
+                  flattened = np.concatenate(arrays)
+                  pipeline_rows = [
+                      row
+                      for key, rows in per_page.items()
+                      if key.endswith(f"/{pipeline}")
+                      for row in rows
+                  ]
+                  aggregate[pipeline] = {
+                      "pages_compared": len(pipeline_rows),
+                      "all_pages_in_correct_order": all(
+                          bool(row["order_match"]) for row in pipeline_rows
+                      ),
+                      "mean_absolute_channel_error_0_255": float(flattened.mean()),
+                      "p99_absolute_channel_error_0_255": float(
+                          np.percentile(flattened, 99)
+                      ),
+                      "max_absolute_channel_error_0_255": int(flattened.max()),
+                  }
+              return {
+                  "contract": {
+                      "baseline": "imagemagick",
+                      "profiles": list(PROFILES),
+                      "pages_per_profile": pages_per_profile,
+                      "pages_compared_per_candidate": len(PROFILES) * pages_per_profile,
+                      "render_dpi": 36,
+                  },
+                  "aggregate": aggregate,
+                  "per_page": per_page,
+              }
+          ''').strip()
+          pattern = r'def visual_qa\(.*?(?=\n\ndef format_mib)'
+          source, count = re.subn(pattern, replacement, source, count=1, flags=re.DOTALL)
+          if count != 1:
+              raise SystemExit(f'expected one visual_qa function, replaced {count}')
+
+          replacements = {
+              'A representative page from every 32-page PDF was rendered at 36 DPI and compared channel-by-channel against the ImageMagick result.':
+                  'The first eight pages from every 32-page PDF were rendered at 36 DPI and compared channel-by-channel against the ImageMagick result; page ordering was also checked.',
+              '- Workspace footprint was sampled every 100 ms and includes the final PDF while present.':
+                  '- Workspace footprint was sampled every 10 ms and includes the final PDF while present.',
+              '- This is a controlled Linux comparison, not a direct benchmark of Homebrew builds on Apple silicon.':
+                  '- This is a controlled macOS hosted-runner comparison on Apple silicon; results remain specific to the reported runner and tool versions.',
+              '- The vips candidates intentionally pay for three CLI process launches per image (thumbnail, gravity, and JPEG save via copy) plus temporary VIPS images; this is the architecture under evaluation.':
+                  '- The vips candidates intentionally pay for two libvips CLI launches per image (thumbnail, then gravity/JPEG save) plus the selected PDF-assembly stage.',
+          }
+          for old, new in replacements.items():
+              if source.count(old) != 1:
+                  raise SystemExit(f'expected one report string: {old!r}; found {source.count(old)}')
+              source = source.replace(old, new)
+
+          path.write_text(source, encoding='utf-8')
+          PY
+
+          python3 -m py_compile .benchmark/run_benchmark.py
+          cp .benchmark/run_benchmark.py final-benchmark-artifacts/harness/run_benchmark.py
+          shasum -a 256 .benchmark/run_benchmark.py \
+            > final-benchmark-artifacts/harness/run_benchmark.py.sha256
+
+      - name: Install benchmark toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install imagemagick vips qpdf pdfcpu poppler
+          python3 -m venv .benchmark/final-venv
+          .benchmark/final-venv/bin/python -m pip install \
+            --disable-pip-version-check --no-cache-dir numpy pillow psutil
+
+      - name: Install pinned cpdf binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .benchmark/bin
+          case "$(uname -m)" in
+            arm64) cpdf_dir=MacOS-ARM ;;
+            x86_64) cpdf_dir=MacOS-Intel ;;
+            *) echo "unsupported macOS architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          curl --fail --location --retry 5 --retry-all-errors \
+            "https://raw.githubusercontent.com/coherentgraphics/cpdf-binaries/6341ce3699e46659bb2b59c216f37d2829ea97f8/${cpdf_dir}/cpdf" \
+            --output .benchmark/bin/cpdf
+          chmod 0755 .benchmark/bin/cpdf
+          shasum -a 256 .benchmark/bin/cpdf \
+            > final-benchmark-artifacts/harness/cpdf-binary.sha256
+          printf '%s\n' "$GITHUB_WORKSPACE/.benchmark/bin" >> "$GITHUB_PATH"
+
+      - name: Run corrected randomized benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          .benchmark/final-venv/bin/python .benchmark/run_benchmark.py \
+            --output final-benchmark-artifacts \
+            2>&1 | tee final-benchmark-artifacts/benchmark-console.log
+
+      - name: Independently QA the result set
+        shell: bash
+        run: |
+          set -euo pipefail
+          .benchmark/final-venv/bin/python - <<'PY'
+          from __future__ import annotations
+
+          import csv
+          import hashlib
+          import json
+          import math
+          from pathlib import Path
+
+          root = Path('final-benchmark-artifacts')
+          expected_pipelines = {
+              'imagemagick', 'vips-cpdf', 'vips-qpdf', 'vips-pdfcpu'
+          }
+          expected_scenarios = {
+              f'{profile}-{pages}'
+              for profile in ('photos', 'documents', 'mixed')
+              for pages in (1, 8, 32)
+          }
+
+          raw = list(csv.DictReader((root / 'raw-results.csv').open(encoding='utf-8')))
+          summary = list(csv.DictReader((root / 'scenario-summary.csv').open(encoding='utf-8')))
+          aggregate = list(csv.DictReader((root / 'pipeline-summary.csv').open(encoding='utf-8')))
+          visual = json.loads((root / 'visual-qa.json').read_text(encoding='utf-8'))
+          harness = (root / 'harness' / 'run_benchmark.py').read_text(encoding='utf-8')
+
+          checks: dict[str, bool] = {}
+          errors: list[str] = []
+
+          def check(name: str, condition: bool, detail: str) -> None:
+              checks[name] = bool(condition)
+              if not condition:
+                  errors.append(detail)
+
+          measured = [row for row in raw if row['warmup'] == 'False']
+          warmups = [row for row in raw if row['warmup'] == 'True']
+          check('raw_row_count', len(raw) == 180, f'expected 180 raw rows, got {len(raw)}')
+          check('measured_row_count', len(measured) == 144, f'expected 144 measured rows, got {len(measured)}')
+          check('warmup_row_count', len(warmups) == 36, f'expected 36 warmups, got {len(warmups)}')
+          check('pipeline_set', {row['pipeline'] for row in raw} == expected_pipelines, 'pipeline set mismatch')
+          check('scenario_set', {row['scenario'] for row in raw} == expected_scenarios, 'scenario set mismatch')
+          check('summary_row_count', len(summary) == 36, f'expected 36 summary rows, got {len(summary)}')
+          check('aggregate_row_count', len(aggregate) == 4, f'expected 4 aggregate rows, got {len(aggregate)}')
+          check('all_return_codes_zero', all(int(row['return_code']) == 0 for row in raw), 'non-zero return code present')
+          check('all_qpdf_checks_pass', all(row['qpdf_check_ok'] == 'True' for row in raw), 'qpdf structural check failed')
+          check('all_page_counts_match', all(int(row['page_count']) == int(row['pages']) for row in raw), 'page-count mismatch present')
+          check(
+              'all_pages_are_a4',
+              all(abs(float(row['page_width_pt']) - 595.44) <= 1.0 and abs(float(row['page_height_pt']) - 841.68) <= 1.0 for row in raw),
+              'non-A4 output present',
+          )
+          check('all_times_positive', all(float(row['wall_seconds']) > 0 for row in raw), 'non-positive wall time present')
+          check('all_memory_positive', all(float(row['peak_child_rss_bytes']) > 0 for row in raw), 'non-positive child RSS present')
+          check('corrected_pdfcpu_configuration', 'pos:c, sc:1 rel' in harness and 'pos:c, dpi:300' not in harness, 'corrected pdfcpu configuration absent')
+
+          visual_aggregate = visual.get('aggregate', {})
+          check('visual_candidate_set', set(visual_aggregate) == expected_pipelines - {'imagemagick'}, 'visual candidate set mismatch')
+          check(
+              'visual_page_count',
+              all(int(item.get('pages_compared', 0)) == 24 for item in visual_aggregate.values()),
+              'a candidate did not compare 24 pages',
+          )
+          check(
+              'visual_ordering',
+              all(bool(item.get('all_pages_in_correct_order')) for item in visual_aggregate.values()),
+              'page-order mismatch present',
+          )
+          check(
+              'visual_mean_error',
+              all(float(item.get('mean_absolute_channel_error_0_255', math.inf)) < 2.0 for item in visual_aggregate.values()),
+              'visual mean error exceeded threshold',
+          )
+          check(
+              'visual_p99_error',
+              all(float(item.get('p99_absolute_channel_error_0_255', math.inf)) <= 15.0 for item in visual_aggregate.values()),
+              'visual p99 error exceeded threshold',
+          )
+
+          complete = not errors and all(checks.values())
+          qa = {
+              'schema_version': 1,
+              'complete': complete,
+              'checks': checks,
+              'errors': errors,
+              'counts': {
+                  'raw_rows': len(raw),
+                  'measured_runs': len(measured),
+                  'warmup_runs': len(warmups),
+                  'scenario_summaries': len(summary),
+                  'pipelines': len(aggregate),
+                  'visual_pages_per_candidate': 24,
+              },
+          }
+          (root / 'QA.json').write_text(json.dumps(qa, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          if not complete:
+              raise SystemExit('independent QA failed: ' + '; '.join(errors))
+
+          fastest = min(aggregate, key=lambda row: float(row['total_median_seconds_across_scenarios']))
+          lowest_worst_rss = min(aggregate, key=lambda row: float(row['max_peak_child_rss_mib']))
+          lines = [
+              '# Corrected image-to-PDF benchmark — key findings',
+              '',
+              '**QA status: PASS.** This file supersedes every earlier benchmark attachment in this conversation.',
+              '',
+              f"- Fastest aggregate pipeline: **{fastest['pipeline']}**, {float(fastest['total_median_seconds_across_scenarios']):.2f} s across the nine scenario medians.",
+              f"- Lowest worst-scenario child-process RSS: **{lowest_worst_rss['pipeline']}**, {float(lowest_worst_rss['max_peak_child_rss_mib']):.1f} MiB.",
+              '',
+              '| Pipeline | Sum of scenario medians (s) | Geometric speedup vs ImageMagick | Median peak child RSS (MiB) | Worst-scenario peak child RSS (MiB) |',
+              '|---|---:|---:|---:|---:|',
+          ]
+          for row in aggregate:
+              lines.append(
+                  f"| {row['pipeline']} | {float(row['total_median_seconds_across_scenarios']):.2f} | {float(row['geometric_speedup_vs_imagemagick']):.2f}× | {float(row['median_peak_child_rss_mib']):.1f} | {float(row['max_peak_child_rss_mib']):.1f} |"
+              )
+          lines.extend([
+              '',
+              'The first pdfcpu setup used `dpi:300`, which left pdfcpu\'s default relative scale of 0.5 active and therefore was not visually equivalent. Those timings are excluded. This benchmark uses `sc:1 rel`, passes page-order and visual-parity checks, and measures all four pipelines in the same randomized run.',
+          ])
+          (root / 'KEY-FINDINGS.md').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+
+          correction = {
+              'supersedes_prior_deliverables': True,
+              'discarded_inputs': [
+                  'failed local probe without vips',
+                  'original vips-pdfcpu timings using dpi:300',
+                  'empty visual-QA object caused by a representative-output path defect',
+              ],
+              'corrections': [
+                  'all four pipelines rerun together on one macOS runner',
+                  'pdfcpu uses sc:1 rel on explicit A4 dimensions',
+                  '24 rendered pages per candidate checked for visual parity and page order',
+                  'independent CSV/JSON structural QA and completion marker added',
+              ],
+          }
+          (root / 'CORRECTION-NOTE.json').write_text(
+              json.dumps(correction, indent=2, sort_keys=True) + '\n', encoding='utf-8'
+          )
+          completion = {
+              'status': 'complete',
+              'qa': 'pass',
+              'measured_runs': len(measured),
+              'warmup_runs': len(warmups),
+              'pipelines': sorted(expected_pipelines),
+              'scenarios': sorted(expected_scenarios),
+              'visual_pages_per_candidate': 24,
+              'github_run_id': json.loads((root / 'environment.json').read_text())['github_run_id'],
+          }
+          (root / 'COMPLETED.json').write_text(
+              json.dumps(completion, indent=2, sort_keys=True) + '\n', encoding='utf-8'
+          )
+
+          checksum_lines = []
+          for path in sorted(root.rglob('*')):
+              if path.is_file() and path.name != 'SHA256SUMS':
+                  digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                  checksum_lines.append(f'{digest}  {path.relative_to(root).as_posix()}')
+          (root / 'SHA256SUMS').write_text('\n'.join(checksum_lines) + '\n', encoding='utf-8')
+          PY
+
+          test -s final-benchmark-artifacts/REPORT.md
+          test -s final-benchmark-artifacts/KEY-FINDINGS.md
+          test -s final-benchmark-artifacts/QA.json
+          test -s final-benchmark-artifacts/COMPLETED.json
+          grep -q '"complete": true' final-benchmark-artifacts/QA.json
+          grep -q '"status": "complete"' final-benchmark-artifacts/COMPLETED.json
+          shasum -a 256 --check final-benchmark-artifacts/SHA256SUMS
+
+      - name: Upload corrected benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-pdf-benchmark-final-corrected-macos-${{ github.run_id }}
+          path: final-benchmark-artifacts/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30
