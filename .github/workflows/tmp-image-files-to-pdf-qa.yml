@@ -1,0 +1,172 @@
+name: Temporary ImageFilesToPDF QA
+
+on:
+  push:
+    branches:
+      - tmp-image-files-to-pdf-qa-20260904
+
+permissions:
+  contents: read
+
+concurrency:
+  group: temporary-image-files-to-pdf-qa-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  source-quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out isolated branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Reconstruct project
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo 'e11972a386456e058e1b05400aef542e7ce797876f621702c75e8cb5caa7f0c2  .ci/image-files-to-pdf.tar.gz.b64' \
+            | sha256sum --check
+          python3 - <<'PY'
+          import base64
+          from pathlib import Path
+
+          source = Path('.ci/image-files-to-pdf.tar.gz.b64')
+          target = Path('image-files-to-pdf.tar.gz')
+          target.write_bytes(base64.b64decode(source.read_bytes(), validate=True))
+          PY
+          echo 'ae003c1365112461533180f69a1b5cc164ff199aa40aaac2e951bdd023f71043  image-files-to-pdf.tar.gz' \
+            | sha256sum --check
+          tar -xzf image-files-to-pdf.tar.gz
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: ImageFilesToPDF/.node-version
+          cache: npm
+          cache-dependency-path: ImageFilesToPDF/package-lock.json
+
+      - name: Run deterministic project gate
+        working-directory: ImageFilesToPDF
+        run: |
+          npm ci --ignore-scripts
+          npm run quality | tee ../node-quality.log
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: v2.8.1
+
+      - name: Run independent JavaScript lint
+        working-directory: ImageFilesToPDF
+        run: deno lint | tee ../deno-lint.log
+
+      - name: Run ShellCheck
+        run: shellcheck ImageFilesToPDF/tests/integration/macos.sh | tee shellcheck.log
+
+      - name: Install and run actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=1.7.12
+          archive="actionlint_${version}_linux_x86_64.tar.gz"
+          curl --fail --location --retry 5 --retry-all-errors \
+            "https://github.com/rhysd/actionlint/releases/download/v${version}/${archive}" \
+            --output "$RUNNER_TEMP/$archive"
+          printf '%s  %s\n' \
+            '8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8' \
+            "$RUNNER_TEMP/$archive" \
+            | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
+          "$RUNNER_TEMP/actionlint" ImageFilesToPDF/.github/workflows/*.yml \
+            | tee actionlint.log
+
+      - name: Upload source-QA evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-files-to-pdf-source-qa-${{ github.run_id }}
+          path: |
+            node-quality.log
+            deno-lint.log
+            shellcheck.log
+            actionlint.log
+            ImageFilesToPDF/dist/
+          if-no-files-found: warn
+          retention-days: 30
+
+  macos-integration:
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - name: Check out isolated branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Reconstruct project
+        shell: bash
+        run: |
+          set -euo pipefail
+          shasum -a 256 .ci/image-files-to-pdf.tar.gz.b64
+          python3 - <<'PY'
+          import base64
+          from pathlib import Path
+
+          source = Path('.ci/image-files-to-pdf.tar.gz.b64')
+          target = Path('image-files-to-pdf.tar.gz')
+          target.write_bytes(base64.b64decode(source.read_bytes(), validate=True))
+          PY
+          actual=$(shasum -a 256 image-files-to-pdf.tar.gz | awk '{print $1}')
+          test "$actual" = 'ae003c1365112461533180f69a1b5cc164ff199aa40aaac2e951bdd023f71043'
+          tar -xzf image-files-to-pdf.tar.gz
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: ImageFilesToPDF/.node-version
+          cache: npm
+          cache-dependency-path: ImageFilesToPDF/package-lock.json
+
+      - name: Install Homebrew runtime and inspection tools
+        run: brew install vips pdfcpu poppler
+
+      - name: Run project gate
+        working-directory: ImageFilesToPDF
+        run: |
+          npm ci --ignore-scripts
+          npm run quality | tee ../macos-node-quality.log
+
+      - name: Run real JXA integration
+        shell: bash
+        run: bash ImageFilesToPDF/tests/integration/macos.sh | tee macos-integration.log
+
+      - name: Record host and tool versions
+        if: always()
+        shell: bash
+        run: |
+          {
+            sw_vers
+            uname -m
+            node --version
+            vips --version
+            pdfcpu version
+            pdfinfo -v 2>&1 | head -1
+          } > macos-tool-versions.txt
+
+      - name: Upload macOS evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-files-to-pdf-macos-qa-${{ github.run_id }}
+          path: |
+            macos-node-quality.log
+            macos-integration.log
+            macos-tool-versions.txt
+            ImageFilesToPDF/dist/
+          if-no-files-found: warn
+          retention-days: 30
