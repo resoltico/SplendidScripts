@@ -58,7 +58,7 @@ jobs:
           set -euo pipefail
           mkdir -p .benchmark/bin
           curl --fail --location --retry 5 --retry-all-errors \
-            https://raw.githubusercontent.com/coherentgraphics/cpdf-binaries/6341ce3699e46659bb2b59c216f37d2829ea97f8/Mac-Arm/cpdf \
+            https://raw.githubusercontent.com/coherentgraphics/cpdf-binaries/6341ce3699e46659bb2b59c216f37d2829ea97f8/MacOS-ARM/cpdf \
             --output .benchmark/bin/cpdf
           chmod 0755 .benchmark/bin/cpdf
           printf '%s\n' "$GITHUB_WORKSPACE/.benchmark/bin" >> "$GITHUB_PATH"
