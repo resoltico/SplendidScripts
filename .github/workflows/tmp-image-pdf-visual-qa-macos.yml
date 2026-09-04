@@ -47,7 +47,9 @@ jobs:
           set -euo pipefail
           brew update
           brew install imagemagick vips qpdf pdfcpu poppler
-          python3 -m pip install --disable-pip-version-check --no-cache-dir \
+          python3 -m venv .benchmark/visual-venv
+          .benchmark/visual-venv/bin/python -m pip install \
+            --disable-pip-version-check --no-cache-dir \
             numpy pillow psutil
 
       - name: Install pinned cpdf binary
@@ -65,7 +67,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          .benchmark/visual-venv/bin/python - <<'PY'
           from __future__ import annotations
 
           import importlib.util
