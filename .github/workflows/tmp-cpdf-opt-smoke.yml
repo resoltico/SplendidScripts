@@ -1,0 +1,65 @@
+name: Temporary cpdf optimized-chain smoke
+
+on:
+  push:
+    branches:
+      - tmp-cpdf-opt-test-20260904
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cpdf poppler
+          python3 -m venv .smoke-venv
+          .smoke-venv/bin/python -m pip install --disable-pip-version-check pillow
+      - name: Exercise cpdf import-merge-scale variants
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf cpdf-smoke && mkdir cpdf-smoke
+          .smoke-venv/bin/python - <<'PY'
+          from PIL import Image, ImageDraw
+          for i in range(3):
+              im=Image.new('RGB',(2481,3507),(255,255,255))
+              d=ImageDraw.Draw(im)
+              d.rectangle((100+i*50,100,2380,3400),outline=(20,40+i*50,100),width=20)
+              d.text((200,200),f'PAGE {i+1}',fill=(0,0,0))
+              im.save(f'cpdf-smoke/{i:02d}.jpg',quality=92,dpi=(300,300))
+          PY
+          for f in cpdf-smoke/*.jpg; do
+            stem=${f%.jpg}
+            cpdf -jpeg "$f" -o "${stem}-raw.pdf"
+          done
+          cpdf -merge cpdf-smoke/00-raw.pdf cpdf-smoke/01-raw.pdf cpdf-smoke/02-raw.pdf -o cpdf-smoke/merged-raw.pdf
+          cpdf -scale-page '0.24 0.24' cpdf-smoke/merged-raw.pdf -o cpdf-smoke/scale-operation-first.pdf
+          cpdf cpdf-smoke/merged-raw.pdf -scale-page '0.24 0.24' -o cpdf-smoke/scale-input-first.pdf
+          cpdf -scale-page '0.24 0.24' cpdf-smoke/merged-raw.pdf all -o cpdf-smoke/scale-range-after.pdf
+          cpdf cpdf-smoke/merged-raw.pdf all -scale-page '0.24 0.24' -o cpdf-smoke/scale-range-before.pdf
+          cpdf -merge cpdf-smoke/00-raw.pdf cpdf-smoke/01-raw.pdf cpdf-smoke/02-raw.pdf AND -scale-page '0.24 0.24' -o cpdf-smoke/merge-and-scale.pdf
+          cpdf -merge cpdf-smoke/00-raw.pdf cpdf-smoke/01-raw.pdf cpdf-smoke/02-raw.pdf AND -range all -scale-page '0.24 0.24' -o cpdf-smoke/merge-and-scale-range.pdf
+          {
+            cpdf -version
+            for f in cpdf-smoke/*.pdf; do
+              echo "--- $f ---"
+              pdfinfo "$f" | grep -E '^(Pages|Page size):'
+            done
+          } | tee cpdf-smoke/results.txt
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cpdf-optimized-smoke-${{ github.run_id }}
+          path: cpdf-smoke/
+          if-no-files-found: error
+          retention-days: 7
