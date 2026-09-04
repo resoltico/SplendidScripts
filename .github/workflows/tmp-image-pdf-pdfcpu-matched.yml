@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: tmp-image-pdf-pdfcpu-matched-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   benchmark:
@@ -131,7 +131,7 @@ jobs:
 
       - name: Upload matched evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a1 # v7.0.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: pdfcpu-matched-${{ matrix.label }}-${{ github.run_id }}
           path: pdfcpu-matched-${{ matrix.label }}/
