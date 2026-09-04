@@ -1,0 +1,137 @@
+name: Temporary image-to-PDF benchmark
+
+on:
+  push:
+    branches:
+      - tmp-image-pdf-benchmark-20260904
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tmp-image-pdf-benchmark-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    env:
+      LC_ALL: C.UTF-8
+      LANG: C.UTF-8
+      MAGICK_THREAD_LIMIT: "4"
+      VIPS_CONCURRENCY: "4"
+      OMP_NUM_THREADS: "4"
+      GOMAXPROCS: "4"
+      BENCHMARK_REPEATS: "4"
+    steps:
+      - name: Check out benchmark branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Expand benchmark harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          gzip --decompress --stdout .benchmark/run_benchmark.py.gz > .benchmark/run_benchmark.py
+          python3 -m py_compile .benchmark/run_benchmark.py
+
+      - name: Install distribution toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            ca-certificates \
+            curl \
+            file \
+            ghostscript \
+            imagemagick \
+            libvips-tools \
+            poppler-utils \
+            python3-numpy \
+            python3-pil \
+            python3-psutil \
+            qpdf \
+            xz-utils
+
+          # Ubuntu's ImageMagick policy commonly disables PDF writing. The benchmark
+          # needs the exact image-to-PDF operation under test, inside an ephemeral VM.
+          for policy in /etc/ImageMagick-*/policy.xml; do
+            if [[ -f "$policy" ]]; then
+              sudo sed -i \
+                -e 's#<policy domain="coder" rights="none" pattern="PDF" */>#<policy domain="coder" rights="read|write" pattern="PDF"/>#g' \
+                -e 's#<policy domain="module" rights="none" pattern="{PS,PDF,XPS}" */>#<policy domain="module" rights="read|write" pattern="{PS,PDF,XPS}"/>#g' \
+                "$policy"
+            fi
+          done
+
+      - name: Install current cpdf and pdfcpu binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .benchmark/bin/pdfcpu-unpack
+
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://raw.githubusercontent.com/coherentgraphics/cpdf-binaries/master/Linux-Intel-64bit/cpdf \
+            --output .benchmark/bin/cpdf
+          chmod 0755 .benchmark/bin/cpdf
+
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://github.com/pdfcpu/pdfcpu/releases/download/v0.15.0/pdfcpu_0.15.0_Linux_x86_64.tar.xz \
+            --output .benchmark/bin/pdfcpu.tar.xz
+          echo '652830db95e81868dbe38fbb3f506365511c99a1831b5e8955deac38f3f645f8  .benchmark/bin/pdfcpu.tar.xz' \
+            | sha256sum --check --strict
+          tar -xJf .benchmark/bin/pdfcpu.tar.xz -C .benchmark/bin/pdfcpu-unpack
+          pdfcpu_source=$(find .benchmark/bin/pdfcpu-unpack -type f -name pdfcpu -perm -u+x -print -quit)
+          test -n "$pdfcpu_source"
+          cp "$pdfcpu_source" .benchmark/bin/pdfcpu
+          chmod 0755 .benchmark/bin/pdfcpu
+          rm -rf .benchmark/bin/pdfcpu-unpack .benchmark/bin/pdfcpu.tar.xz
+          printf '%s\n' "$GITHUB_WORKSPACE/.benchmark/bin" >> "$GITHUB_PATH"
+
+      - name: Record tool probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p benchmark-artifacts/probes
+          {
+            echo '## ImageMagick'
+            (magick -version || convert -version) 2>&1
+            echo '## vips'
+            vips --version 2>&1
+            echo '## vips thumbnail help'
+            vips thumbnail --help-operation 2>&1
+            echo '## vips flatten help'
+            vips flatten --help-operation 2>&1
+            echo '## vips gravity help'
+            vips gravity --help-operation 2>&1
+            echo '## vips copy help'
+            vips copy --help-operation 2>&1
+            echo '## cpdf'
+            cpdf -version 2>&1
+            echo '## qpdf'
+            qpdf --version 2>&1
+            echo '## pdfcpu'
+            pdfcpu version 2>&1
+            echo '## pdfcpu import help'
+            pdfcpu help import 2>&1
+          } | tee benchmark-artifacts/probes/tool-probes.txt
+
+      - name: Run complete randomized benchmark
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .benchmark/run_benchmark.py --output benchmark-artifacts \
+            2>&1 | tee benchmark-artifacts/benchmark-console.log
+
+      - name: Upload raw evidence and report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-pdf-benchmark-${{ github.run_id }}
+          path: benchmark-artifacts/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30
