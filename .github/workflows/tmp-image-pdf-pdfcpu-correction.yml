@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: tmp-corrected-pdfcpu-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   benchmark:
@@ -95,6 +95,22 @@ jobs:
           test -n "$pdfcpu_source"
           cp "$pdfcpu_source" .benchmark/bin/pdfcpu
           chmod 0755 .benchmark/bin/pdfcpu
+          printf '%s\n' "$GITHUB_WORKSPACE/.benchmark/bin" >> "$GITHUB_PATH"
+
+      - name: Install pinned cpdf probe dependency
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .benchmark/bin
+          if [[ "${{ matrix.label }}" == "macos" ]]; then
+            cpdf_platform=MacOS-ARM
+          else
+            cpdf_platform=Linux-Intel-64bit
+          fi
+          curl --fail --location --retry 5 --retry-all-errors \
+            "https://raw.githubusercontent.com/coherentgraphics/cpdf-binaries/6341ce3699e46659bb2b59c216f37d2829ea97f8/$cpdf_platform/cpdf" \
+            --output .benchmark/bin/cpdf
+          chmod 0755 .benchmark/bin/cpdf
           printf '%s\n' "$GITHUB_WORKSPACE/.benchmark/bin" >> "$GITHUB_PATH"
 
       - name: Create isolated Python environment
