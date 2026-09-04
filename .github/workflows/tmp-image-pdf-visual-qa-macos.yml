@@ -1,0 +1,239 @@
+name: Temporary image-to-PDF visual QA — macOS
+
+on:
+  push:
+    branches:
+      - tmp-image-pdf-benchmark-20260904
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tmp-image-pdf-visual-qa-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  visual-qa:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      LC_ALL: en_US.UTF-8
+      LANG: en_US.UTF-8
+      MAGICK_THREAD_LIMIT: "4"
+      VIPS_CONCURRENCY: "4"
+      OMP_NUM_THREADS: "4"
+      GOMAXPROCS: "4"
+    steps:
+      - name: Check out benchmark branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Reconstruct and verify benchmark harness
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat .benchmark/current-chunks/part-* > .benchmark/run_benchmark.py.gz
+          echo '6f17bf64066064856265acc8a34a356c478064e644859b29ac1ef68e832f823a  .benchmark/run_benchmark.py.gz' \
+            | shasum -a 256 --check
+          gzip --decompress --stdout .benchmark/run_benchmark.py.gz > .benchmark/run_benchmark.py
+          echo '95961a6af209d391e13e653cfefb5e0fa7450b26a52bde33d153e4cf7fdb9156  .benchmark/run_benchmark.py' \
+            | shasum -a 256 --check
+          python3 -m py_compile .benchmark/run_benchmark.py
+
+      - name: Install macOS toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew update
+          brew install imagemagick vips qpdf pdfcpu poppler
+          python3 -m pip install --disable-pip-version-check --no-cache-dir \
+            numpy pillow psutil
+
+      - name: Install pinned cpdf binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .benchmark/bin
+          curl --fail --location --retry 5 --retry-all-errors \
+            https://raw.githubusercontent.com/coherentgraphics/cpdf-binaries/6341ce3699e46659bb2b59c216f37d2829ea97f8/Mac-Arm/cpdf \
+            --output .benchmark/bin/cpdf
+          chmod 0755 .benchmark/bin/cpdf
+          printf '%s\n' "$GITHUB_WORKSPACE/.benchmark/bin" >> "$GITHUB_PATH"
+
+      - name: Run cross-pipeline visual and ordering QA
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from __future__ import annotations
+
+          import importlib.util
+          import json
+          import shutil
+          import subprocess
+          from pathlib import Path
+
+          import numpy as np
+          from PIL import Image
+
+          root = Path.cwd()
+          harness_path = root / ".benchmark" / "run_benchmark.py"
+          spec = importlib.util.spec_from_file_location("benchmark_harness", harness_path)
+          if spec is None or spec.loader is None:
+              raise RuntimeError("could not import benchmark harness")
+          bench = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(bench)
+
+          artifact_root = root / "visual-qa-artifacts"
+          corpus = bench.generate_corpus(artifact_root / "corpus")
+          tools = bench.detect_toolchain()
+          pdf_dir = artifact_root / "pdfs"
+          render_dir = artifact_root / "renders"
+          work_dir = artifact_root / "work"
+          pdf_dir.mkdir(parents=True)
+          render_dir.mkdir(parents=True)
+          work_dir.mkdir(parents=True)
+
+          profiles = ("photos", "documents", "mixed")
+          pipelines = bench.PIPELINES
+          pages_per_profile = 8
+          rendered: dict[tuple[str, str, int], np.ndarray] = {}
+          structural: dict[str, object] = {}
+
+          for profile in profiles:
+              inputs = corpus[profile][:pages_per_profile]
+              for pipeline in pipelines:
+                  workspace = work_dir / f"{profile}-{pipeline}"
+                  workspace.mkdir()
+                  output = pdf_dir / f"{profile}-{pipeline}.pdf"
+                  if pipeline == "imagemagick":
+                      bench.pipeline_imagemagick(tools, inputs, output)
+                  elif pipeline == "vips-cpdf":
+                      bench.pipeline_vips_cpdf(tools, inputs, output, workspace)
+                  elif pipeline == "vips-qpdf":
+                      bench.pipeline_vips_qpdf(tools, inputs, output, workspace)
+                  elif pipeline == "vips-pdfcpu":
+                      bench.pipeline_vips_pdfcpu(tools, inputs, output, workspace)
+                  else:
+                      raise RuntimeError(pipeline)
+                  page_count, width, height = bench.parse_pdfinfo(
+                      tools, output, pages_per_profile
+                  )
+                  checked = subprocess.run(
+                      [tools.qpdf, "--check", str(output)],
+                      stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE,
+                      check=False,
+                  )
+                  if checked.returncode != 0:
+                      raise RuntimeError(checked.stderr.decode("utf-8", "replace"))
+                  structural[f"{profile}/{pipeline}"] = {
+                      "pages": page_count,
+                      "page_width_pt": width,
+                      "page_height_pt": height,
+                      "pdf_bytes": output.stat().st_size,
+                      "qpdf_check": True,
+                  }
+                  for page in range(1, pages_per_profile + 1):
+                      destination = render_dir / f"{profile}-{pipeline}-p{page:02d}.png"
+                      bench.render_sample(tools, output, destination, page)
+                      with Image.open(destination) as image:
+                          rendered[(profile, pipeline, page)] = np.asarray(
+                              image.convert("RGB"), dtype=np.int16
+                          )
+                  shutil.rmtree(workspace)
+
+          comparisons: dict[str, object] = {}
+          all_candidate_errors: dict[str, list[np.ndarray]] = {
+              pipeline: [] for pipeline in pipelines[1:]
+          }
+          for profile in profiles:
+              baselines = {
+                  page: rendered[(profile, "imagemagick", page)]
+                  for page in range(1, pages_per_profile + 1)
+              }
+              for pipeline in pipelines[1:]:
+                  page_rows = []
+                  for page in range(1, pages_per_profile + 1):
+                      candidate = rendered[(profile, pipeline, page)]
+                      baseline = baselines[page]
+                      if candidate.shape != baseline.shape:
+                          raise RuntimeError(
+                              f"render shape mismatch {profile}/{pipeline}/p{page}: "
+                              f"{candidate.shape} != {baseline.shape}"
+                          )
+                      error = np.abs(candidate - baseline)
+                      all_candidate_errors[pipeline].append(error)
+                      nearest = min(
+                          baselines,
+                          key=lambda other: float(
+                              np.abs(candidate - baselines[other]).mean()
+                          ),
+                      )
+                      page_rows.append(
+                          {
+                              "page": page,
+                              "nearest_imagemagick_page": nearest,
+                              "order_match": nearest == page,
+                              "mean_absolute_channel_error_0_255": float(error.mean()),
+                              "p99_absolute_channel_error_0_255": float(
+                                  np.percentile(error, 99)
+                              ),
+                              "max_absolute_channel_error_0_255": int(error.max()),
+                              "render_width": int(candidate.shape[1]),
+                              "render_height": int(candidate.shape[0]),
+                          }
+                      )
+                  comparisons[f"{profile}/{pipeline}"] = page_rows
+
+          aggregate = {}
+          for pipeline, arrays in all_candidate_errors.items():
+              flattened = np.concatenate([array.reshape(-1) for array in arrays])
+              rows = [
+                  row
+                  for key, value in comparisons.items()
+                  if key.endswith("/" + pipeline)
+                  for row in value
+              ]
+              aggregate[pipeline] = {
+                  "pages_compared": len(rows),
+                  "all_pages_in_correct_order": all(row["order_match"] for row in rows),
+                  "mean_absolute_channel_error_0_255": float(flattened.mean()),
+                  "p99_absolute_channel_error_0_255": float(
+                      np.percentile(flattened, 99)
+                  ),
+                  "max_absolute_channel_error_0_255": int(flattened.max()),
+              }
+
+          result = {
+              "contract": {
+                  "profiles": list(profiles),
+                  "pages_per_profile": pages_per_profile,
+                  "pages_compared_per_candidate": len(profiles) * pages_per_profile,
+                  "render_dpi": 36,
+                  "baseline": "imagemagick",
+              },
+              "aggregate": aggregate,
+              "structural": structural,
+              "per_page": comparisons,
+          }
+          (artifact_root / "visual-qa.json").write_text(
+              json.dumps(result, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          shutil.rmtree(artifact_root / "corpus")
+          shutil.rmtree(pdf_dir)
+          shutil.rmtree(work_dir)
+          print(json.dumps(result["aggregate"], indent=2, sort_keys=True))
+          PY
+
+      - name: Upload visual QA evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-pdf-visual-qa-macos-${{ github.run_id }}
+          path: visual-qa-artifacts/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30
