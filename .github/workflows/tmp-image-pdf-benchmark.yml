@@ -35,10 +35,10 @@ jobs:
         run: |
           set -euo pipefail
           cat .benchmark/current-chunks/part-* > .benchmark/run_benchmark.py.gz
-          echo '8c3de21d57df592dd7282dc8dc54c35d70c06422fc957203ea4966159ccc2d2c  .benchmark/run_benchmark.py.gz' \
+          echo '6f17bf64066064856265acc8a34a356c478064e644859b29ac1ef68e832f823a  .benchmark/run_benchmark.py.gz' \
             | sha256sum --check --strict
           gzip --decompress --stdout .benchmark/run_benchmark.py.gz > .benchmark/run_benchmark.py
-          echo '9591fdba7c788288f1784c34068815934192da2a2a078aeb1a96852ae838544  .benchmark/run_benchmark.py' \
+          echo '95961a6af209d391e13e653cfefb5e0fa7450b26a52bde33d153e4cf7fdb9156  .benchmark/run_benchmark.py' \
             | sha256sum --check --strict
           python3 -m py_compile .benchmark/run_benchmark.py
           mkdir -p benchmark-artifacts/harness
