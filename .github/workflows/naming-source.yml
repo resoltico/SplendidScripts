@@ -1,0 +1,72 @@
+name: Direct source naming comparison
+
+on:
+  push:
+    branches: [experiment/naming-guidance-evaluation]
+    paths:
+      - .github/naming-source/**
+      - .github/workflows/naming-source.yml
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    name: ${{ matrix.model }} / ${{ matrix.condition }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        model: [qwen-small, qwen-medium]
+        condition: [K7, M2, R9, T4]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Run direct source checks
+        run: python3 .github/naming-source/source_check.py --worker "$MODEL" "$CONDITION"
+        env:
+          MODEL: ${{ matrix.model }}
+          CONDITION: ${{ matrix.condition }}
+          PYTHONUNBUFFERED: '1'
+      - name: Preserve raw responses and scores
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: source-${{ matrix.model }}-${{ matrix.condition }}
+          path: source-results
+          retention-days: 14
+          if-no-files-found: error
+
+  aggregate:
+    name: Aggregate direct source evidence
+    needs: evaluate
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: source-*
+          path: evidence
+          merge-multiple: true
+      - name: Aggregate direct source results
+        run: |
+          cp .github/naming-evaluation/evaluate.py evidence/evaluate.py
+          cp .github/naming-confirmation/confirm.py evidence/confirm.py
+          cp .github/naming-source/source_check.py evidence/source_check.py
+          cp .github/workflows/naming-source.yml evidence/workflow.yml
+          python3 .github/naming-source/source_check.py --aggregate evidence
+      - name: Preserve complete evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: direct-source-naming-evidence
+          path: evidence
+          retention-days: 14
+          if-no-files-found: error
