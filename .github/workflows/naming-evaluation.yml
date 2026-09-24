@@ -1,0 +1,70 @@
+name: Naming guidance evaluation
+
+on:
+  push:
+    branches: [experiment/naming-guidance-evaluation]
+    paths:
+      - .github/naming-evaluation/**
+      - .github/workflows/naming-evaluation.yml
+
+permissions:
+  contents: read
+
+jobs:
+  evaluate:
+    name: ${{ matrix.model }} / ${{ matrix.condition }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        model: [qwen-small, qwen-medium]
+        condition: [K7, M2, R9, T4]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Run frozen comparison
+        run: python3 .github/naming-evaluation/evaluate.py --worker "$MODEL" "$CONDITION"
+        env:
+          MODEL: ${{ matrix.model }}
+          CONDITION: ${{ matrix.condition }}
+          PYTHONUNBUFFERED: '1'
+      - name: Preserve raw responses and scores
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: naming-${{ matrix.model }}-${{ matrix.condition }}
+          path: results
+          retention-days: 14
+          if-no-files-found: error
+
+  aggregate:
+    name: Aggregate without retuning
+    needs: evaluate
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: naming-*
+          path: evidence
+          merge-multiple: true
+      - name: Apply frozen selection rule
+        run: |
+          cp .github/naming-evaluation/evaluate.py evidence/evaluate.py
+          cp .github/workflows/naming-evaluation.yml evidence/workflow.yml
+          python3 .github/naming-evaluation/evaluate.py --aggregate evidence
+      - name: Preserve complete evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: naming-evaluation-evidence
+          path: evidence
+          retention-days: 14
+          if-no-files-found: error
